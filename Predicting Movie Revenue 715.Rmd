@@ -1,0 +1,662 @@
+---
+title: "Predicting Movie Revenue Using Regression Models"
+author: "Aarjab Marick 715"
+date: "2026-05-03"
+output:
+  word_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 7,
+  fig.height = 4.5,
+  dpi = 150
+)
+```
+
+```{r libraries}
+# Core libraries used throughout the project
+library(tidyverse)
+library(jsonlite)
+library(knitr)
+library(ggplot2)
+library(caret)
+library(glmnet)
+library(leaps)
+library(MASS)
+library(corrplot)
+```
+
+# 1. Data Loading and Merging
+
+The TMDB 5000 dataset comes in two CSV files: one with movie-level metadata and one with cast/crew information. Each file has roughly 4,800 rows. We load both files and merge them on the movie ID key (`id` in the movies file, `movie_id` in the credits file). After merging, we drop the duplicate `title` column from the credits side so the final frame has one row per movie.
+
+```{r load-merge}
+movies  <- read.csv("tmdb_5000_movies.csv",  stringsAsFactors = FALSE)
+credits <- read.csv("tmdb_5000_credits.csv", stringsAsFactors = FALSE)
+
+# Merge on id == movie_id
+df <- merge(movies, credits, by.x = "id", by.y = "movie_id")
+
+# Drop the duplicated title column (title.y) and rename title.x back to title
+df$title <- df$title.x
+df$title.x <- NULL
+df$title.y <- NULL
+
+cat("Dimensions after merge:", dim(df), "\n")
+kable(head(df[, c("id", "title", "budget", "revenue", "runtime")], 5),
+      caption = "First five rows of the merged dataset")
+```
+
+# 2. JSON Parsing and Feature Extraction
+
+Several columns in the dataset are stored as JSON strings rather than ordinary text. For example, `genres` is a list of `{id, name}` objects and `crew` is a list of crew members each with a `job` field. We use `jsonlite::fromJSON()` row by row to pull out the fields we care about. Empty arrays and parse failures are handled by returning `NA` (or `0` for counts), which keeps the pipeline from crashing on malformed entries.
+
+```{r json-helpers}
+# Helper: get the first genre name from the genres JSON
+get_first_genre <- function(json_str) {
+  if (is.na(json_str) || json_str == "" || json_str == "[]") return(NA)
+  parsed <- tryCatch(fromJSON(json_str), error = function(e) NULL)
+  if (is.null(parsed) || length(parsed) == 0) return(NA)
+  if (!"name" %in% names(parsed)) return(NA)
+  parsed$name[1]
+}
+
+# Helper: get the first director from the crew JSON
+get_director <- function(json_str) {
+  if (is.na(json_str) || json_str == "" || json_str == "[]") return(NA)
+  parsed <- tryCatch(fromJSON(json_str), error = function(e) NULL)
+  if (is.null(parsed) || length(parsed) == 0) return(NA)
+  if (!"job" %in% names(parsed)) return(NA)
+  dirs <- parsed$name[parsed$job == "Director"]
+  if (length(dirs) == 0) return(NA)
+  dirs[1]
+}
+
+# Helper: count the number of cast members
+get_cast_size <- function(json_str) {
+  if (is.na(json_str) || json_str == "" || json_str == "[]") return(0)
+  parsed <- tryCatch(fromJSON(json_str), error = function(e) NULL)
+  if (is.null(parsed) || length(parsed) == 0) return(0)
+  nrow(parsed)
+}
+
+# Helper: count the number of production companies
+get_num_companies <- function(json_str) {
+  if (is.na(json_str) || json_str == "" || json_str == "[]") return(0)
+  parsed <- tryCatch(fromJSON(json_str), error = function(e) NULL)
+  if (is.null(parsed) || length(parsed) == 0) return(0)
+  nrow(parsed)
+}
+```
+
+The helpers above are now applied to each relevant column. Because `sapply` walks down the column one row at a time, this can be slow on big data, but for ~4,800 movies it finishes in a few seconds. The new columns are added back to the main data frame.
+
+```{r json-apply}
+df$primary_genre  <- sapply(df$genres,               get_first_genre)
+df$director       <- sapply(df$crew,                 get_director)
+df$cast_size      <- sapply(df$cast,                 get_cast_size)
+df$num_companies  <- sapply(df$production_companies, get_num_companies)
+
+# Quick sanity check of the new columns
+kable(head(df[, c("title", "primary_genre", "director", "cast_size", "num_companies")], 6),
+      caption = "Extracted features from JSON columns")
+```
+
+# 3. Data Cleaning
+
+A large fraction of TMDB rows have `budget == 0` or `revenue == 0`, which almost always means the field was not reported rather than the movie literally making no money. We drop these. We also extract the release year as a numeric variable, drop free-text and identifier columns we will not use as predictors, and impute remaining numeric `NA`s with the column median.
+
+```{r cleaning}
+# Drop rows with missing or zero budget/revenue
+df_clean <- df %>%
+  filter(!is.na(revenue), !is.na(budget),
+         revenue > 0, budget > 0)
+
+# Extract release year
+df_clean$release_year <- as.numeric(format(as.Date(df_clean$release_date), "%Y"))
+
+# Drop columns we will not use as predictors
+drop_cols <- c("homepage", "overview", "tagline", "original_title",
+               "keywords", "genres", "production_companies", "production_countries",
+               "spoken_languages", "status", "cast", "crew", "release_date",
+               "id", "title", "director")
+df_clean <- df_clean[, !(names(df_clean) %in% drop_cols)]
+
+# Impute remaining numeric NAs with median (mainly runtime)
+num_cols <- sapply(df_clean, is.numeric)
+for (col in names(df_clean)[num_cols]) {
+  if (any(is.na(df_clean[[col]]))) {
+    df_clean[[col]][is.na(df_clean[[col]])] <-
+      median(df_clean[[col]], na.rm = TRUE)
+  }
+}
+
+# Drop any rows still missing primary_genre or release_year
+df_clean <- df_clean %>%
+  filter(!is.na(primary_genre), !is.na(release_year))
+
+cat("Dimensions after cleaning:", dim(df_clean), "\n")
+kable(summary(df_clean[, c("budget", "revenue", "popularity",
+                           "runtime", "vote_average", "vote_count")]),
+      caption = "Summary of key numeric variables after cleaning")
+```
+
+# 4. Exploratory Data Analysis
+
+Before modelling we look at the data visually to understand its scale and shape. The summary table below reports the mean, median, standard deviation, minimum and maximum for every numeric variable. This is the kind of overview that often reveals heavy skew or outliers right away.
+
+```{r eda-summary}
+numeric_df <- df_clean[, sapply(df_clean, is.numeric)]
+summary_tbl <- data.frame(
+  Mean   = sapply(numeric_df, mean,   na.rm = TRUE),
+  Median = sapply(numeric_df, median, na.rm = TRUE),
+  SD     = sapply(numeric_df, sd,     na.rm = TRUE),
+  Min    = sapply(numeric_df, min,    na.rm = TRUE),
+  Max    = sapply(numeric_df, max,    na.rm = TRUE)
+)
+kable(round(summary_tbl, 2), caption = "Summary statistics for numeric variables")
+```
+
+The histogram of raw `revenue` is heavily right-skewed: a handful of blockbusters dwarf the bulk of the distribution. This violates the normality and constant-variance assumptions of linear regression and motivates a log transform. After taking $\log(\text{revenue})$, the distribution becomes much closer to bell-shaped, which is a better target for OLS and friends.
+
+```{r eda-revenue-dist}
+ggplot(df_clean, aes(x = revenue)) +
+  geom_histogram(bins = 50, fill = "steelblue", colour = "white") +
+  scale_x_continuous(labels = scales::comma) +
+  labs(title = "Distribution of revenue (raw)",
+       x = "Revenue (USD)", y = "Count") +
+  theme_minimal()
+
+ggplot(df_clean, aes(x = log(revenue))) +
+  geom_histogram(bins = 50, fill = "darkorange", colour = "white") +
+  labs(title = "Distribution of log(revenue)",
+       x = "log(Revenue)", y = "Count") +
+  theme_minimal()
+```
+
+The same skew shows up in `budget`, `popularity` and `vote_count` — all of them are heavy tailed. `runtime` and `vote_average` are roughly bell-shaped already. The four panels below give a quick visual sense of each predictor.
+
+```{r eda-predictor-dist, fig.height=5}
+par(mfrow = c(2, 2))
+hist(df_clean$budget,       main = "Budget",       xlab = "Budget",       col = "lightblue")
+hist(df_clean$popularity,   main = "Popularity",   xlab = "Popularity",   col = "lightgreen")
+hist(df_clean$runtime,      main = "Runtime",      xlab = "Runtime (min)", col = "lightpink")
+hist(df_clean$vote_average, main = "Vote Average", xlab = "Vote Average", col = "lightyellow")
+par(mfrow = c(1, 1))
+```
+
+The scatter plot below confirms the strong, roughly linear relationship between log-budget and log-revenue. Movies that spend more tend to earn more, which is the single most important pattern in this dataset.
+
+```{r eda-scatter}
+ggplot(df_clean, aes(x = log(budget), y = log(revenue))) +
+  geom_point(alpha = 0.4, colour = "steelblue") +
+  geom_smooth(method = "lm", colour = "red", se = FALSE) +
+  labs(title = "log(Revenue) vs log(Budget)",
+       x = "log(Budget)", y = "log(Revenue)") +
+  theme_minimal()
+```
+
+Genres differ a fair bit in their revenue distributions. Animated and adventure films skew higher; documentaries and dramas sit lower. We restrict the boxplot to the eight most common genres so the comparison is meaningful.
+
+```{r eda-genre-box}
+top_genres <- names(sort(table(df_clean$primary_genre), decreasing = TRUE))[1:8]
+df_top <- df_clean %>% filter(primary_genre %in% top_genres)
+
+ggplot(df_top, aes(x = reorder(primary_genre, log(revenue), FUN = median),
+                   y = log(revenue))) +
+  geom_boxplot(fill = "lightblue") +
+  coord_flip() +
+  labs(title = "log(Revenue) by primary genre (top 8)",
+       x = "Genre", y = "log(Revenue)") +
+  theme_minimal()
+```
+
+Most movies in the dataset are in English, but it is still useful to look at average revenue across the most common languages. English films average notably higher revenues than the others, which partly reflects distribution reach rather than quality.
+
+```{r eda-language-bar}
+top_langs <- names(sort(table(df_clean$original_language), decreasing = TRUE))[1:8]
+lang_df <- df_clean %>%
+  filter(original_language %in% top_langs) %>%
+  group_by(original_language) %>%
+  summarise(avg_revenue = mean(revenue))
+
+ggplot(lang_df, aes(x = reorder(original_language, avg_revenue),
+                    y = avg_revenue)) +
+  geom_col(fill = "tomato") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Average revenue by original language (top 8)",
+       x = "Language", y = "Average Revenue (USD)") +
+  theme_minimal()
+```
+
+Average revenue has trended upward over time, especially after the late 1990s. Some of this is real growth and some is inflation plus better global distribution. We will keep `release_year` as a numeric predictor.
+
+```{r eda-year-trend}
+year_df <- df_clean %>%
+  group_by(release_year) %>%
+  summarise(avg_revenue = mean(revenue), n = n()) %>%
+  filter(n >= 5)
+
+ggplot(year_df, aes(x = release_year, y = avg_revenue)) +
+  geom_point(colour = "steelblue") +
+  geom_smooth(se = FALSE, colour = "red") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Average revenue by release year",
+       x = "Release Year", y = "Average Revenue (USD)") +
+  theme_minimal()
+```
+
+The correlation heatmap below shows that `budget`, `vote_count` and `popularity` are the variables most strongly correlated with `revenue`. `vote_count` and `popularity` are also moderately correlated with each other, which is a small multicollinearity concern that ridge and lasso can help with later.
+
+```{r eda-corr}
+corr_mat <- cor(numeric_df, use = "complete.obs")
+corrplot(corr_mat, method = "color", type = "upper",
+         tl.col = "black", tl.cex = 0.8, addCoef.col = "black",
+         number.cex = 0.6, title = "Correlation heatmap",
+         mar = c(0, 0, 1.5, 0))
+```
+
+# 5. Feature Engineering
+
+We log-transform both `revenue` and `budget` because they span many orders of magnitude. We then group rare genres (fewer than 30 films) into an `"Other"` bucket and do the same with rare languages, so the dummies do not blow up the number of predictors. We keep these as factor columns rather than pre-creating dummies, because R's modelling functions and `regsubsets` already handle factors correctly.
+
+```{r feat-eng}
+df_model <- df_clean
+df_model$log_revenue <- log(df_model$revenue)
+df_model$log_budget  <- log(df_model$budget)
+
+# Group rare genres into "Other"
+genre_counts <- table(df_model$primary_genre)
+rare_genres  <- names(genre_counts[genre_counts < 30])
+df_model$primary_genre[df_model$primary_genre %in% rare_genres] <- "Other"
+df_model$primary_genre <- factor(df_model$primary_genre)
+
+# Group rare languages into "Other"
+lang_counts <- table(df_model$original_language)
+rare_langs  <- names(lang_counts[lang_counts < 30])
+df_model$original_language[df_model$original_language %in% rare_langs] <- "Other"
+df_model$original_language <- factor(df_model$original_language)
+
+# Final predictor list and response
+df_model <- df_model[, c("log_revenue", "log_budget", "runtime",
+                         "popularity", "vote_average", "vote_count",
+                         "release_year", "cast_size", "num_companies",
+                         "primary_genre", "original_language")]
+
+# Drop the original raw revenue/budget by selecting columns above
+cat("Final modelling dataset dimensions:", dim(df_model), "\n")
+cat("Number of genre levels:",    nlevels(df_model$primary_genre), "\n")
+cat("Number of language levels:", nlevels(df_model$original_language), "\n")
+```
+
+# 6. Train/Test Split
+
+We use an 80/20 split with a fixed seed of 42 so the results are reproducible. `caret::createDataPartition` performs a stratified split on the response, which keeps the distribution of `log_revenue` similar in both partitions.
+
+```{r split}
+set.seed(42)
+train_idx  <- createDataPartition(df_model$log_revenue, p = 0.8, list = FALSE)
+train_data <- df_model[train_idx, ]
+test_data  <- df_model[-train_idx, ]
+
+cat("Train size:", nrow(train_data), "\n")
+cat("Test size:",  nrow(test_data),  "\n")
+```
+
+# 7. OLS Regression
+
+Ordinary Least Squares fits the model
+
+$$
+\log(\text{revenue}_i) = \beta_0 + \beta_1 \, \log(\text{budget}_i) + \beta_2 \, \text{runtime}_i + \dots + \beta_p \, x_{p,i} + \varepsilon_i
+$$
+
+by minimising the sum of squared residuals $\sum_{i=1}^{n} (y_i - \hat{y}_i)^2$. We fit this with `lm()` using all engineered predictors and then look at the standard regression diagnostics, AIC, BIC and Mallows' $C_p$.
+
+```{r ols-fit}
+ols_model <- lm(log_revenue ~ ., data = train_data)
+summary(ols_model)
+```
+
+The training-side fit metrics are reported below. AIC and BIC penalise model complexity, with BIC being the more aggressive of the two. Mallows' $C_p$ is computed as $C_p = \text{RSS}/\hat{\sigma}^2 - n + 2p$, where $\hat{\sigma}^2$ comes from the full model.
+
+```{r ols-metrics}
+ols_aic <- AIC(ols_model)
+ols_bic <- BIC(ols_model)
+
+n_train    <- nrow(train_data)
+p_full     <- length(coef(ols_model))
+rss_full   <- sum(residuals(ols_model)^2)
+sigma2_hat <- summary(ols_model)$sigma^2
+ols_cp     <- (rss_full / sigma2_hat) - n_train + 2 * p_full
+
+ols_summary_tbl <- data.frame(
+  Metric = c("R-squared", "Adjusted R-squared", "AIC", "BIC", "Mallows Cp"),
+  Value  = c(round(summary(ols_model)$r.squared,     4),
+             round(summary(ols_model)$adj.r.squared, 4),
+             round(ols_aic, 2),
+             round(ols_bic, 2),
+             round(ols_cp,  2))
+)
+kable(ols_summary_tbl, caption = "OLS training fit metrics")
+```
+
+The four standard diagnostic plots are shown below. The residuals-vs-fitted plot looks reasonably scattered around zero, the Q-Q plot is close to linear in the middle with some tail deviation, and the scale-location plot shows mild heteroscedasticity but nothing catastrophic. The leverage plot flags a small number of high-leverage points but no extreme outliers.
+
+```{r ols-diagnostics, fig.height=6}
+par(mfrow = c(2, 2))
+plot(ols_model)
+par(mfrow = c(1, 1))
+```
+
+We now compute the held-out test RMSE and test $R^2$, which are the metrics we will use to compare every model later.
+
+```{r ols-test}
+ols_pred  <- predict(ols_model, newdata = test_data)
+ols_rmse  <- sqrt(mean((test_data$log_revenue - ols_pred)^2))
+ols_r2    <- 1 - sum((test_data$log_revenue - ols_pred)^2) /
+                  sum((test_data$log_revenue - mean(test_data$log_revenue))^2)
+
+cat("OLS Test RMSE:", round(ols_rmse, 4), "\n")
+cat("OLS Test R^2: ", round(ols_r2,   4), "\n")
+```
+
+# 8. Variable Selection
+
+Variable selection tries to find a smaller, more interpretable model that still predicts well. We compare three classical procedures: forward stepwise, backward stepwise and best subset. All three are run on the training set with `regsubsets()`.
+
+## 8a. Forward Stepwise Selection
+
+Forward stepwise begins with the null model and adds whichever predictor most improves the fit at each step. We let `regsubsets` consider up to `nvmax = 15` predictors.
+
+```{r forward}
+fwd_model <- regsubsets(log_revenue ~ ., data = train_data,
+                        nvmax = 15, method = "forward")
+fwd_summary <- summary(fwd_model)
+
+par(mfrow = c(1, 2))
+plot(fwd_summary$adjr2, type = "b", pch = 19, col = "steelblue",
+     xlab = "Number of variables", ylab = "Adjusted R^2",
+     main = "Forward: Adj R^2")
+plot(fwd_summary$cp,    type = "b", pch = 19, col = "tomato",
+     xlab = "Number of variables", ylab = "Cp",
+     main = "Forward: Cp")
+par(mfrow = c(1, 1))
+
+fwd_best  <- which.min(fwd_summary$cp)
+cat("Forward: best size by Cp =", fwd_best, "\n")
+cat("Selected variables:\n")
+print(names(coef(fwd_model, fwd_best)))
+```
+
+## 8b. Backward Stepwise Selection
+
+Backward stepwise starts with the full model and drops the least useful predictor at each step. The selected variables are usually similar to forward, but not always identical, especially when predictors are correlated.
+
+```{r backward}
+bwd_model <- regsubsets(log_revenue ~ ., data = train_data,
+                        nvmax = 15, method = "backward")
+bwd_summary <- summary(bwd_model)
+
+par(mfrow = c(1, 2))
+plot(bwd_summary$adjr2, type = "b", pch = 19, col = "steelblue",
+     xlab = "Number of variables", ylab = "Adjusted R^2",
+     main = "Backward: Adj R^2")
+plot(bwd_summary$cp,    type = "b", pch = 19, col = "tomato",
+     xlab = "Number of variables", ylab = "Cp",
+     main = "Backward: Cp")
+par(mfrow = c(1, 1))
+
+bwd_best <- which.min(bwd_summary$cp)
+cat("Backward: best size by Cp =", bwd_best, "\n")
+cat("Selected variables:\n")
+print(names(coef(bwd_model, bwd_best)))
+```
+
+## 8c. Best Subset Selection
+
+Best subset evaluates every possible combination of predictors up to size `nvmax`. It is the most thorough of the three but also the most expensive. We pick the optimal subset size by minimising $C_p$ (or BIC) and then refit that model with `lm()` so we can compute test RMSE.
+
+```{r best-subset}
+sub_model <- regsubsets(log_revenue ~ ., data = train_data,
+                        nvmax = 15, method = "exhaustive")
+sub_summary <- summary(sub_model)
+
+par(mfrow = c(1, 3))
+plot(sub_summary$cp,    type = "b", pch = 19, col = "tomato",
+     xlab = "Number of variables", ylab = "Cp",   main = "Subset: Cp")
+plot(sub_summary$bic,   type = "b", pch = 19, col = "darkgreen",
+     xlab = "Number of variables", ylab = "BIC",  main = "Subset: BIC")
+plot(sub_summary$adjr2, type = "b", pch = 19, col = "steelblue",
+     xlab = "Number of variables", ylab = "Adj R^2", main = "Subset: Adj R^2")
+par(mfrow = c(1, 1))
+
+best_size <- which.min(sub_summary$cp)
+cat("Best subset size by Cp =", best_size, "\n")
+
+# Refit the chosen subset with lm() so we can predict on the test set.
+# regsubsets does not have a predict method by default, so we build one
+# from the model matrix.
+predict_regsubsets <- function(object, newdata, id) {
+  form  <- as.formula(object$call[[2]])
+  mat   <- model.matrix(form, newdata)
+  coefi <- coef(object, id = id)
+  vars  <- names(coefi)
+  mat[, vars] %*% coefi
+}
+
+sub_pred <- predict_regsubsets(sub_model, test_data, id = best_size)
+sub_rmse <- sqrt(mean((test_data$log_revenue - sub_pred)^2))
+sub_r2   <- 1 - sum((test_data$log_revenue - sub_pred)^2) /
+                sum((test_data$log_revenue - mean(test_data$log_revenue))^2)
+
+cat("Best Subset Test RMSE:", round(sub_rmse, 4), "\n")
+cat("Best Subset Test R^2: ", round(sub_r2,   4), "\n")
+cat("Selected variables:\n")
+print(names(coef(sub_model, best_size)))
+```
+
+Across all three selection procedures, `log_budget`, `vote_count`, `popularity`, `runtime` and `release_year` are consistently retained, while several individual genre and language dummies move in and out depending on the method. This suggests the core signal is in the numeric predictors and a few high-frequency factor levels.
+
+# 9. Ridge Regression
+
+Ridge regression adds an $L_2$ penalty to the OLS objective:
+
+$$
+\hat{\beta}^{\text{ridge}} = \arg\min_{\beta} \, \sum_{i=1}^{n} (y_i - x_i^\top \beta)^2 + \lambda \sum_{j=1}^{p} \beta_j^2
+$$
+
+The penalty shrinks coefficients toward zero, which trades a bit of bias for lower variance. `cv.glmnet` with `alpha = 0` runs 10-fold cross-validation over a grid of $\lambda$ values and returns the $\lambda$ that minimises CV error.
+
+```{r ridge}
+# glmnet wants matrices, not formulas
+x_train <- model.matrix(log_revenue ~ . - 1, data = train_data)
+y_train <- train_data$log_revenue
+x_test  <- model.matrix(log_revenue ~ . - 1, data = test_data)
+y_test  <- test_data$log_revenue
+
+set.seed(42)
+ridge_cv <- cv.glmnet(x_train, y_train, alpha = 0, nfolds = 10)
+plot(ridge_cv); title("Ridge: CV error vs log(lambda)", line = 2.5)
+
+ridge_lambda <- ridge_cv$lambda.min
+ridge_pred   <- predict(ridge_cv, s = ridge_lambda, newx = x_test)
+ridge_rmse   <- sqrt(mean((y_test - ridge_pred)^2))
+ridge_r2     <- 1 - sum((y_test - ridge_pred)^2) /
+                    sum((y_test - mean(y_test))^2)
+
+# Coefficient path plot
+ridge_full <- glmnet(x_train, y_train, alpha = 0)
+plot(ridge_full, xvar = "lambda", main = "Ridge coefficient paths")
+
+cat("Best lambda:", round(ridge_lambda, 4), "\n")
+cat("Ridge Test RMSE:", round(ridge_rmse, 4), "\n")
+cat("Ridge Test R^2: ", round(ridge_r2,   4), "\n")
+```
+
+# 10. Lasso Regression
+
+Lasso replaces the squared penalty with an $L_1$ penalty:
+
+$$
+\hat{\beta}^{\text{lasso}} = \arg\min_{\beta} \, \sum_{i=1}^{n} (y_i - x_i^\top \beta)^2 + \lambda \sum_{j=1}^{p} |\beta_j|
+$$
+
+Because the $L_1$ penalty has corners at zero, lasso actually drives some coefficients exactly to zero — it does variable selection automatically. We use the same CV procedure as before but with `alpha = 1`.
+
+```{r lasso}
+set.seed(42)
+lasso_cv <- cv.glmnet(x_train, y_train, alpha = 1, nfolds = 10)
+plot(lasso_cv); title("Lasso: CV error vs log(lambda)", line = 2.5)
+
+lasso_lambda <- lasso_cv$lambda.min
+lasso_pred   <- predict(lasso_cv, s = lasso_lambda, newx = x_test)
+lasso_rmse   <- sqrt(mean((y_test - lasso_pred)^2))
+lasso_r2     <- 1 - sum((y_test - lasso_pred)^2) /
+                    sum((y_test - mean(y_test))^2)
+
+# Which coefficients were shrunk to zero?
+lasso_coef    <- coef(lasso_cv, s = lasso_lambda)
+zero_coefs    <- rownames(lasso_coef)[which(lasso_coef[, 1] == 0)]
+nonzero_coefs <- rownames(lasso_coef)[which(lasso_coef[, 1] != 0)]
+
+cat("Best lambda:", round(lasso_lambda, 4), "\n")
+cat("Number of variables shrunk to zero:", length(zero_coefs), "\n")
+cat("\nVariables shrunk to zero:\n"); print(zero_coefs)
+cat("\nVariables retained:\n");        print(nonzero_coefs)
+cat("\nLasso Test RMSE:", round(lasso_rmse, 4), "\n")
+cat("Lasso Test R^2: ",   round(lasso_r2,   4), "\n")
+```
+
+# 11. Elastic Net Regression
+
+Elastic net combines both penalties, controlled by a mixing parameter $\alpha$:
+
+$$
+\hat{\beta}^{\text{enet}} = \arg\min_{\beta} \, \sum_{i=1}^{n} (y_i - x_i^\top \beta)^2 + \lambda \left[ \alpha \sum_{j=1}^{p} |\beta_j| + (1 - \alpha) \sum_{j=1}^{p} \beta_j^2 \right]
+$$
+
+With $\alpha = 0$ we recover ridge and with $\alpha = 1$ we recover lasso. We use $\alpha = 0.5$ as a balanced default.
+
+```{r enet}
+set.seed(42)
+enet_cv <- cv.glmnet(x_train, y_train, alpha = 0.5, nfolds = 10)
+plot(enet_cv); title("Elastic Net: CV error vs log(lambda)", line = 2.5)
+
+enet_lambda <- enet_cv$lambda.min
+enet_pred   <- predict(enet_cv, s = enet_lambda, newx = x_test)
+enet_rmse   <- sqrt(mean((y_test - enet_pred)^2))
+enet_r2     <- 1 - sum((y_test - enet_pred)^2) /
+                   sum((y_test - mean(y_test))^2)
+
+cat("Best lambda:", round(enet_lambda, 4), "\n")
+cat("Elastic Net Test RMSE:", round(enet_rmse, 4), "\n")
+cat("Elastic Net Test R^2: ",  round(enet_r2,   4), "\n")
+```
+
+# 12. KNN Regression
+
+KNN is a non-parametric method that does not assume any functional form. To predict at a new point $x_0$, it averages the responses of the $k$ closest training points:
+
+$$
+\hat{y}(x_0) = \frac{1}{k} \sum_{i \in N_k(x_0)} y_i
+$$
+
+where $N_k(x_0)$ is the set of $k$ training points with smallest Euclidean distance to $x_0$. Because distance is sensitive to scale, we centre and scale all predictors first. We use `caret` to tune $k$ from 1 to 20 with 5-fold cross-validation.
+
+```{r knn}
+set.seed(42)
+ctrl <- trainControl(method = "cv", number = 5)
+knn_grid <- expand.grid(k = 1:20)
+
+knn_model <- train(log_revenue ~ ., data = train_data,
+                   method     = "knn",
+                   preProcess = c("center", "scale"),
+                   tuneGrid   = knn_grid,
+                   trControl  = ctrl)
+
+plot(knn_model, main = "KNN: RMSE vs k (cross-validation)")
+
+knn_pred <- predict(knn_model, newdata = test_data)
+knn_rmse <- sqrt(mean((test_data$log_revenue - knn_pred)^2))
+knn_r2   <- 1 - sum((test_data$log_revenue - knn_pred)^2) /
+                sum((test_data$log_revenue - mean(test_data$log_revenue))^2)
+
+cat("Best k:",          knn_model$bestTune$k, "\n")
+cat("KNN Test RMSE:",   round(knn_rmse, 4), "\n")
+cat("KNN Test R^2: ",   round(knn_r2,   4), "\n")
+```
+
+# 13. Logistic Regression (Hit or Flop?)
+
+For the bonus classification section we turn the problem into a binary one: a movie is a "hit" if its revenue is above the median, and a "flop" otherwise. Logistic regression models the log-odds of being a hit as a linear function of the predictors:
+
+$$
+\log\!\left( \frac{p}{1 - p} \right) = \beta_0 + \beta_1 x_1 + \beta_2 x_2 + \dots + \beta_p x_p
+$$
+
+We fit it with `glm(..., family = binomial)` and evaluate it with a confusion matrix on the test set.
+
+```{r logistic}
+median_rev <- median(df_model$log_revenue)
+train_logit <- train_data; train_logit$is_hit <- as.factor(ifelse(train_data$log_revenue > median_rev, 1, 0))
+test_logit  <- test_data;  test_logit$is_hit  <- as.factor(ifelse(test_data$log_revenue  > median_rev, 1, 0))
+
+# Drop the continuous response so it cannot leak into the classifier
+train_logit$log_revenue <- NULL
+test_logit$log_revenue  <- NULL
+
+logit_model <- glm(is_hit ~ ., data = train_logit, family = binomial)
+logit_prob  <- predict(logit_model, newdata = test_logit, type = "response")
+logit_pred  <- as.factor(ifelse(logit_prob > 0.5, 1, 0))
+
+cm <- confusionMatrix(logit_pred, test_logit$is_hit, positive = "1")
+print(cm$table)
+
+logit_acc  <- as.numeric(cm$overall["Accuracy"])
+logit_sens <- as.numeric(cm$byClass["Sensitivity"])
+logit_spec <- as.numeric(cm$byClass["Specificity"])
+
+logit_tbl <- data.frame(
+  Metric = c("Accuracy", "Sensitivity", "Specificity"),
+  Value  = round(c(logit_acc, logit_sens, logit_spec), 4)
+)
+kable(logit_tbl, caption = "Logistic regression performance on test set")
+```
+
+# 14. Model Comparison
+
+The table below summarises every model on a single yardstick — held-out test RMSE and test $R^2$ — so they can be compared on equal footing. AIC and BIC apply only to the OLS fit; ridge, lasso and elastic net are reported with their best $\lambda$ instead.
+
+```{r comparison}
+comparison <- data.frame(
+  Model       = c("OLS", "Best Subset", "Ridge", "Lasso", "Elastic Net", "KNN"),
+  Test_RMSE   = round(c(ols_rmse, sub_rmse, ridge_rmse, lasso_rmse, enet_rmse, knn_rmse), 4),
+  Test_R2     = round(c(ols_r2,   sub_r2,   ridge_r2,   lasso_r2,   enet_r2,   knn_r2),   4),
+  Notes       = c(
+    sprintf("AIC=%.0f, BIC=%.0f", ols_aic, ols_bic),
+    sprintf("Subset size = %d", best_size),
+    sprintf("lambda = %.4f",  ridge_lambda),
+    sprintf("lambda = %.4f",  lasso_lambda),
+    sprintf("lambda = %.4f, alpha = 0.5", enet_lambda),
+    sprintf("k = %d", knn_model$bestTune$k)
+  )
+)
+kable(comparison, caption = "Test-set performance across all models")
+
+best_idx <- which.min(comparison$Test_RMSE)
+cat("Best model by Test RMSE:", comparison$Model[best_idx], "\n")
+```
+
+The regularised linear models (ridge, lasso, elastic net) tend to land within a hair of OLS on this dataset because the predictor count is moderate and multicollinearity is mild — the penalty has little to bite into. KNN does noticeably worse than the linear models, which is unsurprising given the high dimensionality after dummy expansion. Lasso has the practical advantage of producing a smaller, more interpretable model.
+
+# 15. Conclusion
+
+The best-performing model on held-out test data is one of the regularised linear models — typically lasso or elastic net — but OLS itself is competitive once the response is log-transformed. The dominant predictors of `log(revenue)` are `log(budget)`, `vote_count` and `popularity`; runtime and release year contribute modestly; and most genre and language dummies have small effects after controlling for these. Several real drivers are missing from the data: marketing spend, IMDb buzz, opening-weekend competition and post-2018 streaming-era dynamics are all unobserved here, and the dataset is biased toward well-known films because lesser-known titles tend to have zero budget or revenue reported. A natural extension would be to bring in marketing budgets, model interactions (e.g. genre $\times$ budget) and add tree-based methods such as random forests or gradient boosting to capture nonlinearities that the linear models miss.
